@@ -85,10 +85,10 @@ if (Test-Path $realSeal) {
 
 # ---------------------------------------------------------- 2. pip packages
 if (-not $SkipPip) {
-    Write-Info "installing Python packages (pymupdf, pillow)..."
+    Write-Info "installing Python packages (pymupdf, pillow, pdf2docx)..."
     & python -m pip install --upgrade --quiet pip
-    & python -m pip install --upgrade --quiet pymupdf pillow
-    $check = & python -c "import pymupdf, PIL; print('pymupdf', pymupdf.__version__)"
+    & python -m pip install --upgrade --quiet pymupdf pillow pdf2docx
+    $check = & python -c "import pymupdf, PIL, pdf2docx; print('pymupdf', pymupdf.__version__)"
     if ($LASTEXITCODE -ne 0) {
         Write-Bad "Python packages could not be installed."
         Write-Host "        Try:  python -m pip install --user pymupdf pillow"

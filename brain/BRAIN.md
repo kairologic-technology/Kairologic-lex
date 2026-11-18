@@ -320,3 +320,144 @@ that file for the item-by-item table. Key code points in `court_ocr/app.py`:
 `_on_close` now saves `ui.geometry` + `ui.tab`. Automation cancel works by raising
 `JobCancelled` inside the pipeline progress callback. The result card replaced the
 "Finished" messagebox. Run verified end-to-end on the sample case (7.4 s, 8 pages, 0.25 MB).
+
+---
+
+# 🧠 BRAIN — REFRESHED MASTER SECTION (2026-10-16)
+
+> **This is the current truth.** Everything above this line is the historical
+> session log (kept for context). From now on: read this section first, and
+> append every new change to the Change log at the bottom of THIS section.
+
+## Project in one paragraph
+**KattyVision** (v1.0.0) — a local, offline, zero-cost Windows app that prepares
+bank/court case PDFs for the Raigad court e-filing portal (SARFAESI cases).
+One pipeline replaces a ~1-hour manual routine:
+**merge → cover → OCR → compress → paginate → stamp → split** (~6–60 s per case).
+Python 3.10+ (dev box: `C:\Users\ipvis\AppData\Local\Programs\Python\Python311\python.exe`,
+NOT on PATH), tkinter/ttkbootstrap GUI + CLI, PyMuPDF + Tesseract.
+
+## Key facts — do NOT re-discover these
+- Python at `C:\Users\ipvis\AppData\Local\Programs\Python\Python311\python.exe`;
+  `pythonw.exe` sits next to it (used by shortcuts, no console). No `py` launcher.
+- Local git repo only, no remote. Recent commits: "all the chnages",
+  "complete porject", "Add the portable one-click package…".
+- ttkbootstrap + tkinterdnd2 installed; requirements.txt still lists them under
+  "optional extras" comments — code degrades gracefully if missing.
+- Tesseract required for OCR; Ghostscript optional (legacy `compress.engine=levels`).
+  SETUP.ps1 installs both.
+- Start-up crashes go to `logs\startup_error.log` (pythonw has no console).
+- Brand: `brand/kattyvision.png`, taskbar icon `assets/app.ico` (built by
+  `tools/make_brand_icon.py`), APP_ID `KattyVision.Desktop.1`, signed "Kathirvel".
+- Single-instance mutex `KattyVision.SingleInstance.Mutex`.
+- DPI awareness: `enable_dpi_awareness()` must run before Tk is created (PC runs
+  150% scaling, 1920×1080); `App._fit_to_screen()` clamps geometry.
+- Drag & drop MUST use direct tkdnd package calls (`tk.call("tkdnd::drop_target",…)`)
+  — tkinterdnd2 mixin methods don't exist on plain tk roots.
+- `logs/` has 150+ run logs and `work/qa_sandbox/` contains a full embedded
+  Python — both are churn, not source. Don't index them.
+
+## Architecture map (as of 2026-10-16)
+```
+court_ocr/__init__.py     v1.0.0, MIN_PYTHON (3,10) guard
+court_ocr/app.py          GUI (~233 KB): App, PRESETS, PORTALS limits, TOOL_HANDOFF,
+                          PreviewPanel, ToolPage, ScrollFrame, hero/celebrate,
+                          entry point + startup crash-report fallback
+court_ocr/pipeline.py     Pipeline.run(): 7 steps + CSV PipelineReport; safe
+                          folder-overlap validation; timestamped Run_ subfolder
+                          when prior results exist; StepTimer logging
+court_ocr/pdf_ops.py      collect_inputs, merge_files, add_cover_page,
+                          add_page_numbers, split_pdf / split_pdf_at_cuts,
+                          compress_pdf (legacy levels engine), StepResult,
+                          is_readable_pdf
+court_ocr/ocr_engine.py   run_ocr: parallel Tesseract (process pool), skip_text
+                          default, weak-page recheck (ink_fraction /
+                          looks_incomplete), OcrResult counters
+court_ocr/optimize.py     adaptive compressor optimize_pdf: classify_page per
+                          page (text/gray/photo/bitonal), QualityPreset presets,
+                          PRODUCER "KattyVision 1.0.0 (adaptive optimizer)"
+court_ocr/stamp.py        apply_stamp (seal PNG + text lines, remove_white,
+                          rotation, nudge), generate_seal_png placeholder
+court_ocr/config.py       Config.load/save/get/set/resolve (dotted keys), DEFAULTS
+court_ocr/toolcheck.py    diagnose(cfg): probes tesseract/ghostscript
+court_ocr/logging_setup.py file+console logging, StepTimer
+court_ocr/splash.py       loading splash
+court_ocr/ui_kit.py       shared UI components (~95 KB)
+court_ocr/cli.py          CLI runner
+INSTALL.ps1 / UNINSTALL.ps1 / SETUP.ps1    shortcuts (pythonw -m court_ocr.app), deps
+tools/build_release.ps1   portable one-click package (KattyVision-1.0.0, embedded python)
+tools/                    selftest, ui_tests, split_tests, compress_tests,
+                          splash_tests, brand_flow_check, brand_controls_check,
+                          ocr_quality_speed, ocr_safety_check, verify_output,
+                          make_sample_pdf, make_brand_icon
+```
+
+## Pipeline rules (from pipeline.py)
+- Steps selectable via `steps=[…]`; each has an `*.enabled` config flag.
+- `PipelineReport` → CSV `<final_name>_report.csv` in the case output folder.
+  Status is **OK only if every step is ok AND there are zero warnings**.
+- Input/output/work trees must not overlap (`_validate_run_paths`) — protects
+  against `clean_work` erasing inputs or finished filings.
+- Prior case results are preserved: next run writes to
+  `output/<case>/Run_<timestamp>/`; never silently replaced.
+- Stamp: real seal → `assets/stamp_PLACEHOLDER.png` → generated placeholder.
+  A placeholder is reported loudly (step marked not-OK + warning) — court safety.
+- Split: modes pages/size/both; bookmark boundaries respected inside the limit;
+  final-name template sanitised (Indian case numbers contain "/").
+- Intermediates `01_merged … 06_stamped` in `work/<case>/`, cleaned unless
+  `output.keep_intermediate_files`.
+
+## Verified measurements (trusted, don't re-test)
+- Sample case (4 docs, 8 pages): **6–8 s total**, 4.19 MB → 1.19 MB (−72%).
+- 300 scanned pages: **0.72 s/page** with pool (~3.6 min); 1.41 s/page serial.
+- OCR: 31/31 key words, 100% pages kept on clean/faded/noisy scans.
+- Adaptive compress: 1.40 → 0.56 MB (−60%); text layer survives 100%;
+  200 dpi scan → 300 dpi 1-bit output (sharper, smaller).
+- Split: 300 pages @40 → `[40×7, 20]`; limit obeyed exactly.
+
+## Upcoming / roadmap (not yet done)
+1. Parallelise adaptive compression (single-threaded, ~0.28 s/page — slowest step).
+2. Fix QUALITY.md §2.5 wording (metadata renamed, not blanked).
+3. Confirm `assets/stamp.png` is the bank's REAL seal before court filing.
+4. Scale-up candidates: batch multi-case runner, watch-folder mode, cross-case
+   report summary, git hygiene (.gitignore for logs/work/output churn, remote).
+5. Append every new change to the Change log below — keep this file current.
+
+## Change log (newest first — APPEND EVERY SESSION HERE)
+### 2026-10-16 — Brain file refreshed (this entry)
+- Requested: single up-to-date project memory instead of re-reading all files.
+- Changed: brain/BRAIN.md — added REFRESHED MASTER SECTION with current
+  architecture map (verified against file sizes/mtimes), pipeline rules,
+  measurements, roadmap, and this change log for future sessions.
+- Verified: structure from list of definitions + directory listing; file dates
+  show app.py (10-12), pipeline.py (10-12), pdf_ops.py (10-10), optimize.py (10-01).
+
+### 2026-10-01..10-12 — production hardening (in code, recorded here)
+- pipeline.py: `_validate_run_paths`, timestamped run subfolder, final-name
+  sanitisation, `pagination.font_file`, placeholder-seal reporting, honest
+  split detail lines.
+- stamp.py: rotation, remove_white(+threshold), nudge options.
+- optimize.py: producer string → "KattyVision 1.0.0 (adaptive optimizer)".
+- pdf_ops.py: split rewrite (page limit exact, `_part_end`, MB rule opt-in).
+
+### 2026-09-29 — portable build, splash, guards
+- tools/build_release.ps1 (portable package, embedded Python); splash.py;
+  logging_setup StepTimer; `__init__.py` MIN_PYTHON guard.
+
+### 2026-09-28 — big session (full detail in the historical log above)
+- Split rewrite; Compress tool page → adaptive engine; KattyVision branding +
+  hand-off flow; OCR quality/speed proof; Preview tab + drag & drop; UX
+  makeover; 150% DPI + mouse-wheel fixes; tabbed UI redesign; invisible-window
+  + uninstall fixes.
+
+### 2026-09-26..27 — first build
+- Pipeline, pdf_ops, ocr_engine, config, CLI, GUI v1, INSTALL/SETUP/UNINSTALL.
+
+## Session template (copy for every future change)
+```
+### YYYY-MM-DD — <one-line title>
+- Requested: ...
+- Changed: <file:lines>
+- Verified: <tool/measure>
+- Notes/watch-outs: ...
+```

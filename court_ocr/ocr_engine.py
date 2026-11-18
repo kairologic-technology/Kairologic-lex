@@ -258,9 +258,9 @@ def _coverage_ranges(
         return []
     seeds = _ranges(needed, chunk_count)
     ranges: list[tuple[int, int]] = []
-    for index, (start, _) in enumerate(seeds):
+    for index, (start, end) in enumerate(seeds):
         low = 0 if index == 0 else ranges[-1][1] + 1
-        ranges.append((low, max(start, low)))
+        ranges.append((low, max(end, low)))
     for index in range(len(ranges) - 1):
         ranges[index] = (ranges[index][0], ranges[index + 1][0] - 1)
     ranges[-1] = (ranges[-1][0], total_pages - 1)

@@ -852,7 +852,7 @@ class Switch(tk.Frame):
                  hint: str = "", variable: tk.Variable | None = None,
                  command: Callable[[bool], None] | None = None,
                  background: str = CARD) -> None:
-        super().__init__(master, bg=background, cursor="hand2", takefocus=1)
+        super().__init__(master, bg=background, takefocus=1)
         self.command = command
         self.variable = variable
         self._value = bool(value)
@@ -864,27 +864,30 @@ class Switch(tk.Frame):
                 pass
 
         self.track = tk.Frame(self, bg=BORDER_STRONG, width=px(40),
-                              height=px(22), highlightthickness=0)
+                              height=px(22), highlightthickness=0, cursor="hand2")
         self.track.pack(side="left", padx=(0, px(10)))
         self.knob = tk.Frame(self.track, bg="#ffffff", width=px(16),
-                             height=px(16), highlightthickness=0)
+                             height=px(16), highlightthickness=0, cursor="hand2")
         self.knob.place(relx=0.0, rely=0.5, anchor="w", x=px(3))
 
         text = tk.Frame(self, bg=background)
-        text.pack(side="left", fill="x", expand=True)
+        text.pack(side="left")
         self.label = tk.Label(text, text=label, bg=background, fg=TEXT,
-                              font=(FONT, BODY), anchor="w", justify="left")
+                              font=(FONT, BODY), anchor="w", justify="left",
+                              cursor="hand2")
         self.label.pack(anchor="w")
         if hint:
             self.hint = tk.Label(text, text=hint, bg=background, fg=MUTED,
                                  font=(FONT, CAPTION), anchor="w", justify="left",
-                                 wraplength=px(340))
+                                 wraplength=px(340), cursor="hand2")
             self.hint.pack(anchor="w", pady=(2, 0))
         else:
             self.hint = None
 
-        for widget in (self, self.track, self.knob, text, self.label,
-                       self.hint or self):
+        clickable = [self.track, self.knob, self.label]
+        if self.hint is not None:
+            clickable.append(self.hint)
+        for widget in clickable:
             widget.bind("<Button-1>", lambda _e: self.toggle())
         self.bind("<Return>", lambda _e: self.toggle())
         self.bind("<KP_Enter>", lambda _e: self.toggle())
@@ -956,6 +959,12 @@ class Stepper(tk.Frame):
         self.value_label.bind("<Return>", self._commit)
         self.value_label.bind("<FocusOut>", self._commit)
         self.value_label.bind("<Escape>", lambda _e: self.variable.set(self._text()))
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.value_label.unbind_class("TSpinbox", seq)
+                self.value_label.unbind_class("Spinbox", seq)
+            except tk.TclError:
+                pass
 
     def _clamp(self, value: float) -> float:
         return round(max(self.minimum, min(self.maximum, float(value))), self.decimals)
@@ -1016,15 +1025,16 @@ class Disclosure(tk.Frame):
         self._open = bool(start_open)
         self.title = title
 
-        self.head = tk.Frame(self, bg=background, cursor="hand2", takefocus=1)
+        self.head = tk.Frame(self, bg=background, takefocus=0)
         self.head.pack(fill="x")
         self.chevron = Icon(self.head, "chevron", size=14, color=ACCENT,
                             background=background)
+        self.chevron.configure(cursor="hand2")
         self.chevron.pack(side="left", padx=(0, px(7)), pady=px(5))
         self.button = tk.Label(self.head, text="", bg=background, fg=ACCENT,
                                font=(FONT, CAPTION, "bold"), cursor="hand2",
                                takefocus=1, anchor="w", pady=px(5))
-        self.button.pack(side="left", fill="x", expand=True)
+        self.button.pack(side="left")
 
         # The body uses grid so that Field rows (which grid their own children)
         # can be placed inside it without mixing geometry managers.
@@ -1037,7 +1047,7 @@ class Disclosure(tk.Frame):
             self.hint_label.grid(row=0, column=0, columnspan=2, sticky="w",
                                  pady=(0, px(8)))
             self._next_row = 1
-        for widget in (self.head, self.button, self.chevron):
+        for widget in (self.button, self.chevron):
             widget.bind("<Button-1>", lambda _e: self.toggle())
             widget.bind("<Return>", lambda _e: self.toggle())
             widget.bind("<KP_Enter>", lambda _e: self.toggle())

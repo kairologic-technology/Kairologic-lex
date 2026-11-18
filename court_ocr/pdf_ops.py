@@ -293,6 +293,38 @@ def collect_inputs(
     return found
 
 
+def collect_case_folders(
+    folder: str | Path,
+    extensions: Sequence[str],
+    *,
+    natural: bool = True,
+) -> tuple[list[Path], list[Path]]:
+    """Split a parent folder into per-case child folders for a batch run.
+
+    Returns ``(case_folders, loose_files)``.  A child folder counts as a case
+    when it holds at least one processable document (at any depth).  Files
+    sitting loose in the parent are reported separately: they are skipped,
+    never mixed into a case.
+    """
+    root = Path(folder)
+    exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
+    case_folders: list[Path] = []
+    loose_files: list[Path] = []
+    if not root.is_dir():
+        return case_folders, loose_files
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return case_folders, loose_files
+    loose_files = sorted_naturally(
+        [c for c in children if c.is_file() and c.suffix.lower() in exts
+         and not c.name.startswith(SKIP_PREFIXES)], natural)
+    for sub in sorted_naturally([c for c in children if c.is_dir()], natural):
+        if collect_inputs(sub, exts, natural=natural):
+            case_folders.append(sub)
+    return case_folders, loose_files
+
+
 def is_readable_pdf(path: str | Path) -> tuple[bool, str]:
     """Cheap validation: can PyMuPDF open this file and does it have pages?"""
     try:
@@ -400,30 +432,16 @@ def _append_pdf(
 ) -> int:
     """Append a PDF and return how many pages were added.
 
-    Pages carrying a /Rotate flag are re-drawn onto a fresh page via
-    ``show_pdf_page`` ("baked"), so stamping and page numbering always land
-    where the reader actually sees them.  Text stays selectable.
+    Direct insert_pdf preserves original page orientation, vectors, and annotations
+    without distortion or inversion caused by redrawing onto fresh pages.
     """
     added = 0
     with pymupdf.open(src) as sdoc:
         if sdoc.needs_pass:
             raise RuntimeError("PDF is password protected - remove the password first")
-        rotations = {page.rotation % 360 for page in sdoc}
-        if not flatten_rotation or rotations <= {0}:
-            start = out.page_count
-            out.insert_pdf(sdoc, links=keep_links, annots=keep_links)
-            added = out.page_count - start
-        else:
-            for pno in range(sdoc.page_count):
-                page = sdoc[pno]
-                if page.rotation % 360 == 0:
-                    out.insert_pdf(sdoc, from_page=pno, to_page=pno,
-                                   links=keep_links, annots=keep_links)
-                else:
-                    rect = page.rect                  # already the displayed size
-                    fresh = out.new_page(width=rect.width, height=rect.height)
-                    fresh.show_pdf_page(fresh.rect, sdoc, pno)
-                added += 1
+        start = out.page_count
+        out.insert_pdf(sdoc, links=keep_links, annots=keep_links)
+        added = out.page_count - start
     return added
 
 
@@ -1283,3 +1301,121 @@ def add_cover_page(
                         f"no online service used", 8, gap=0)
         _save_compact(doc, out_path)
         return doc.page_count
+
+# ---------------------------------------------------------------------------
+# Post-split, per-part compression (the "compress at the end" workflow)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PartCompressResult:
+    """Outcome of compressing the *split parts* (not the merged document)."""
+
+    files: list[Path] = field(default_factory=list)
+    #: Parts that were already inside the limit and were not touched.
+    skipped_parts: list[str] = field(default_factory=list)
+    #: Parts that could not be brought under the limit.
+    failed_parts: list[str] = field(default_factory=list)
+    seconds: float = 0.0
+    before_mb: float = 0.0
+    after_mb: float = 0.0
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed_parts
+
+
+def compress_parts(
+    parts: Sequence[Path],
+    *,
+    target_mb: float,
+    preset: str = "balanced",
+    text_dpi: int | None = None,
+    photo_dpi: int | None = None,
+    photo_quality: int | None = None,
+    gray_quality: int | None = None,
+    threshold: int | None = None,
+    bitonal: bool | None = None,
+    scrub_metadata: bool = True,
+    progress: ProgressFn | None = None,
+) -> PartCompressResult:
+    """Bring every **oversized part** under ``target_mb``, in place.
+
+    Parts that are already inside the limit are never touched - their pages
+    keep the exact bytes (and therefore the exact quality) they had after the
+    split.  Only oversized parts are optimised, and the optimiser stops as
+    soon as the part fits, so a part that shrinks at rung 1 never pays for
+    rungs 2 and 3.  Compression happens at the **end** of the pipeline, so the
+    number of pages is fully decided before a single page is squeezed and the
+    target is unambiguous: "this exact file must fit the portal".
+
+    Returns a :class:`PartCompressResult`; the original ``parts`` list is
+    rewritten in place, so the caller can keep using the same paths.
+    """
+    from . import optimize                       # late import: avoids a cycle
+
+    started = time.perf_counter()
+    result = PartCompressResult()
+    oversized = [p for p in parts if (p.stat().st_size / MB) > target_mb]
+
+    for path in parts:
+        if path not in oversized:
+            result.files.append(path)
+            result.skipped_parts.append(
+                f"{path.name} already {path.stat().st_size / MB:.1f} MB")
+            if progress:
+                progress(f"[compress-parts] {path.name}: already fits, untouched")
+
+    for path in oversized:
+        before = path.stat().st_size / MB
+        result.before_mb += before
+        if progress:
+            progress(f"[compress-parts] {path.name}: {before:.1f} MB -> "
+                     f"target {target_mb:.1f} MB")
+        tmp = path.with_name(f"{path.stem}_c{path.suffix}")
+        try:
+            out = optimize.optimize_pdf(
+                path, tmp,
+                preset=preset,
+                text_dpi=text_dpi,
+                photo_dpi=photo_dpi,
+                photo_quality=photo_quality,
+                gray_quality=gray_quality,
+                threshold=threshold,
+                bitonal=bitonal,
+                scrub_metadata=scrub_metadata,
+                target_mb=target_mb,
+                progress=progress,
+            )
+            ok = out.ok
+            detail = out.detail
+            if out.ok:
+                tmp.replace(path)
+            else:
+                # A part that cannot fit is reported, not hidden - the user
+                # decides whether to accept it or lower the portal limit.
+                tmp.replace(path)                # still use the smaller version
+                result.failed_parts.append(
+                    f"{path.name}: {out.after_mb:.1f} MB after compression "
+                    f"(limit {target_mb:.1f} MB)")
+            result.after_mb += path.stat().st_size / MB
+            result.files.append(path)
+            LOGGER.info("[compress-parts] %s: %.2f -> %.2f MB (%s)", path.name,
+                        before, path.stat().st_size / MB,
+                        "fits" if ok else "still above limit")
+        except Exception as exc:                 # never lose the part
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+            result.failed_parts.append(f"{path.name}: {type(exc).__name__}: {exc}")
+            result.files.append(path)
+            LOGGER.error("[compress-parts] %s failed: %s", path.name, exc)
+
+    result.seconds = time.perf_counter() - started
+    done = len(oversized)
+    result.detail = (f"{len(parts)} part(s) checked, {done} compressed, "
+                     f"{len(result.skipped_parts)} already inside the limit"
+                     if parts else "no parts")
+    if done:
+        result.detail += (f"; {result.before_mb:.1f} -> {result.after_mb:.1f} MB "
+                          f"on compressed parts")
+    return result

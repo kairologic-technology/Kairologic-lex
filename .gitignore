@@ -30,3 +30,8 @@ release/
 # product. Anything in tools/ starting with "_" is one of these. (The real test
 # and build scripts do not use that prefix.)
 tools/_*.py
+
+handoff/
+handoff.zip
+*.html
+*.docx

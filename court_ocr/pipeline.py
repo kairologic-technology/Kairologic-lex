@@ -231,6 +231,9 @@ class Pipeline:
             raise ValueError(f"Input folder does not exist or is not a folder: {input_dir}")
         self._validate_run_paths(input_dir, output_dir, self.work)
         case = safe_filename(case_name or self.cfg.case_name or Path(input_dir).name, "Case")
+        # The filename templates ({case}) read the case from the config; keep it
+        # in step with this run so batch runs name each filing after its folder.
+        self.cfg.set("case.name", case)
         wanted = {s.lower() for s in steps} if steps else set(STEP_ORDER)
 
         case_output = Path(output_dir) / case
@@ -393,53 +396,6 @@ class Pipeline:
                              ok=ocr.ok, detail=detail, pages=ocr.pages_total)
                 current, pages = ocr.path, ocr.pages_total
 
-        # -------------------------------------------------------- 5. compress
-        if "compress" in wanted and self.cfg.get("compress.enabled"):
-            target = float(self.cfg.get("compress.target_size_mb", 0) or 0)
-            # split.max_size_mb is the opt-in *splitting* rule; when it is set it
-            # also becomes a reasonable compression target.  It is 0 by default,
-            # so the portal's MB limit above is what compression chases.
-            target = float(self.cfg.get("split.max_size_mb", 0) or 0) or target
-            comp_target = work / "04_compressed.pdf"
-            with StepTimer(LOGGER, "compress") as timer:
-                if str(self.cfg.get("compress.engine", "adaptive")).lower() == "levels":
-                    comp = pdf_ops.compress_pdf(
-                        current, comp_target,
-                        level=int(self.cfg.get("compress.level", 0) or 0),
-                        levels_to_try=self.cfg.get("compress.levels_to_try") or [1, 2, 3],
-                        target_mb=target,
-                        dpi=int(self.cfg.get("compress.image_downsample_dpi", 150) or 150),
-                        jpeg_quality=int(self.cfg.get("ocr.jpeg_quality", 75) or 75),
-                        grayscale=bool(self.cfg.get("compress.grayscale_below_mb", 0)),
-                        gs_exe=self.tools["ghostscript"].path,
-                        progress=self.progress,
-                    )
-                    note = f"{comp.saving_pct:.0f}% smaller via {comp.engine}"
-                else:
-                    comp = optimize.optimize_pdf(
-                        current, comp_target,
-                        preset=str(self.cfg.get("quality.preset", "balanced") or "balanced"),
-                        text_dpi=self._quality_int("quality.text_dpi"),
-                        photo_dpi=self._quality_int("quality.photo_dpi"),
-                        photo_quality=self._quality_int("quality.photo_quality"),
-                        gray_quality=self._quality_int("quality.gray_quality"),
-                        threshold=self._quality_int("quality.threshold"),
-                        bitonal=bool(self.cfg.get("quality.bitonal", True)),
-                        scrub_metadata=bool(self.cfg.get("quality.scrub_metadata", True)),
-                        target_mb=target,
-                        progress=self.progress,
-                    )
-                    note = comp.detail
-            if not comp.ok:
-                note += f"; still above the {target:.2f} MB portal limit"
-                report.warnings.append(
-                    f"merged PDF is {comp.after_mb:.2f} MB - above {target:.2f} MB "
-                    f"even after compression; the splitter will keep parts within the limit"
-                )
-            self._record(report, "compress", current, comp.path, timer.seconds,
-                         ok=comp.ok, detail=note, pages=pages)
-            current = comp.path
-
         # ------------------------------------------------------- 6. paginate
         if "paginate" in wanted and self.cfg.get("pagination.enabled"):
             page_target = work / "05_paginated.pdf"
@@ -584,6 +540,43 @@ class Pipeline:
                     final_path.unlink()
                 current.replace(final_path)
             outputs = [final_path]
+
+        # ------------------------------------------- 8b. compress the parts
+        # The user's rule: only the FINAL files must fit the portal, so the
+        # squeezing happens here, at the very end, part by part.  Parts that
+        # already fit keep their exact bytes - zero quality change for them.
+        if "compress" in wanted and self.cfg.get("compress.enabled") and outputs:
+            target = float(self.cfg.get("compress.target_size_mb", 0)
+                           or self.cfg.get("split.max_size_mb", 0) or 0)
+            if target <= 0:
+                # No per-file portal limit configured - nothing to chase.
+                LOGGER.info("[compress-parts] no target_size_mb set - "
+                            "parts are written as-is")
+            else:
+                with StepTimer(LOGGER, "compress parts") as timer:
+                    pc = pdf_ops.compress_parts(
+                        outputs,
+                        target_mb=target,
+                        preset=str(self.cfg.get("quality.preset", "balanced")
+                                   or "balanced"),
+                        text_dpi=self._quality_int("quality.text_dpi"),
+                        photo_dpi=self._quality_int("quality.photo_dpi"),
+                        photo_quality=self._quality_int("quality.photo_quality"),
+                        gray_quality=self._quality_int("quality.gray_quality"),
+                        threshold=self._quality_int("quality.threshold"),
+                        bitonal=bool(self.cfg.get("quality.bitonal", True)),
+                        scrub_metadata=bool(self.cfg.get("quality.scrub_metadata", True)),
+                        progress=self.progress,
+                    )
+                for note in pc.skipped_parts:
+                    LOGGER.info("[compress-parts] %s", note)
+                for note in pc.failed_parts:
+                    report.warnings.append(
+                        f"part above the {target:.2f} MB limit even after "
+                        f"compression: {note}")
+                self._record(report, "compress", outputs[0] if outputs else None,
+                             outputs[0] if outputs else None, pc.seconds,
+                             ok=pc.ok, detail=pc.detail, pages=pages)
 
         # ----------------------------------------------------------- 9. finish
         if self.progress:

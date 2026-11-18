@@ -187,15 +187,16 @@ STEP_ROWS: tuple[tuple[str, str], ...] = (
     ("merge", "Join all documents into one PDF"),
     ("cover", "Add the contents page"),
     ("ocr", "Make the scans searchable"),
-    ("compress", "Shrink the file to fit the portal"),
     ("paginate", "Add page numbers"),
     ("stamp", "Add the bank seal"),
     ("split", "Split into upload-sized files"),
+    ("compress", "Shrink only the parts above the portal limit"),
 )
 
 STEP_ALIASES = {
     "merge": "merge", "cover": "cover", "ocr": "ocr", "compress": "compress",
     "paginate": "paginate", "pagination": "paginate", "stamp": "stamp", "split": "split",
+    "compress parts": "compress", "compress-parts": "compress",
 }
 
 
@@ -246,6 +247,15 @@ def apply_theme(root: tk.Misc) -> ttk.Style:
         focused = root.focus_get()
         if focused is not None and focused is not event.widget and isinstance(focused.master, Stepper):
             focused.master._commit()
+
+    # Prevent scrolling the mouse wheel from accidentally altering number inputs,
+    # steppers, comboboxes, or sliders when hovering over them while scrolling.
+    for widget_class in ("TSpinbox", "Spinbox", "TCombobox", "Combobox", "Scale", "TScale"):
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                root.unbind_class(widget_class, sequence)
+            except tk.TclError:
+                pass
 
     root.bind("<Button-1>", commit_number, add="+")
     style = ttk.Style(root)
@@ -995,6 +1005,76 @@ class ToolSpec:
     pick_files: bool = True        # False = pick a single folder instead
 
 
+# ------------------------------------------------------------------ PDF -> Word
+def _parse_page_range(text: str) -> tuple[int | None, int | None]:
+    """Parse a page range like ``"1-5"`` or ``"3"`` into 0-based ``(start, end)``.
+
+    ``end`` is exclusive, matching pdf2docx.  ``(None, None)`` means "every
+    page" (blank or unparseable input).
+    """
+    text = (text or "").strip()
+    if not text:
+        return None, None
+    parts = text.replace(" ", "").split("-")
+    try:
+        if len(parts) == 1:
+            page = int(parts[0])
+            if page < 1:
+                return None, None
+            return page - 1, page
+        if len(parts) == 2:
+            first, last = int(parts[0]), int(parts[1])
+            if first < 1 or last < first:
+                return None, None
+            return first - 1, last
+    except ValueError:
+        pass
+    return None, None
+
+
+def _tool_pdf_to_word(paths, out_dir, opts, ctx) -> tuple[list, list]:
+    """Convert each PDF to a Word (.docx) file, keeping the layout intact.
+
+    Left / centre / right alignment, fonts, sizes and spacing are recreated in
+    the Word document.  Each file is converted independently, so one bad file
+    is reported as a warning and does not stop the rest of the batch.
+    """
+    try:
+        from pdf2docx import Converter
+    except ImportError as exc:  # pragma: no cover - only when the dep is missing
+        raise RuntimeError(
+            "PDF to Word needs the 'pdf2docx' package, which is not installed.\n"
+            "Install it once with:  python -m pip install pdf2docx"
+        ) from exc
+
+    outputs: list[Path] = []
+    warnings: list[str] = []
+    start, end = _parse_page_range(str(opts.get("page_range", "") or ""))
+
+    for index, path in enumerate(paths, 1):
+        ctx["progress"](f"file {index} of {len(paths)}: {path.name}")
+        out_path = out_dir / f"{path.stem}_word.docx"
+        try:
+            cv = Converter(str(path))
+            try:
+                if start is not None and end is not None:
+                    cv.convert(str(out_path), start=start, end=end)
+                else:
+                    cv.convert(str(out_path))
+            finally:
+                cv.close()
+            # Verify the output file was actually produced and is non-empty.
+            if not out_path.exists() or out_path.stat().st_size == 0:
+                warnings.append(
+                    f"{path.name}: conversion ran but produced an empty Word file"
+                )
+                continue
+            outputs.append(out_path)
+        except Exception as exc:  # noqa: BLE001 - one bad file must not stop the batch
+            warnings.append(f"{path.name}: could not convert to Word ({exc})")
+    return outputs, warnings
+
+
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         "merge", "Merge",
@@ -1088,6 +1168,18 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         ),
         _tool_split,
     ),
+    ToolSpec(
+        "pdf_to_word", "PDF to Word",
+        "Converts each PDF into a Word (.docx) file, keeping the layout as "
+        "close as possible - text alignment (left / centre / right), fonts, "
+        "sizes and spacing are recreated in the Word document. Works best on "
+        "clean, digitally created PDFs. Scanned pages have no text layer, so "
+        "run them through the OCR tool first.",
+        (
+            ("text", "Page range to convert (blank = all pages, e.g. 1-5)", "page_range", "", None),
+        ),
+        _tool_pdf_to_word,
+    ),
 )
 
 
@@ -1095,7 +1187,8 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
 # These replaced emoji, which rendered at a different size on every machine,
 # broke DPI scaling and fought the flat palette.
 TOOL_ICON = {"merge": "book", "ocr": "search", "compress": "package",
-             "paginate": "hash", "stamp": "tag", "split": "cut"}
+             "paginate": "hash", "stamp": "tag", "split": "cut",
+             "pdf_to_word": "document"}
 
 
 #: Which single-task pages logically FOLLOW each tool.  After a run the result
@@ -1109,6 +1202,7 @@ TOOL_HANDOFF: dict[str, tuple[str, ...]] = {
     "paginate": ("stamp", "split"),
     "stamp": ("split",),
     "split": (),
+    "pdf_to_word": (),
 }
 
 
@@ -2561,6 +2655,7 @@ class App(ttkb.Window if ttkb else tk.Tk):
         self.var_status = tk.StringVar(value="Ready. Pick the documents folder, then press RUN.")
         self.var_found = tk.StringVar(value="No folder checked yet.")
         self.var_details = tk.BooleanVar(value=False)
+        self.var_batch = tk.BooleanVar(value=bool(cfg.get("batch.enabled", False)))
 
     # ---------------------------------------------------------------- layout
     def _build_layout(self, splash=None) -> None:
@@ -2684,9 +2779,11 @@ class App(ttkb.Window if ttkb else tk.Tk):
 
         ttk.Label(card, text="Case name", style="Card.TLabel").grid(
             row=0, column=0, sticky="w", pady=4, padx=(0, 10))
-        ttk.Entry(card, textvariable=self.var_case).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(card, text="shown in every file name", style="CardMuted.TLabel").grid(
-            row=0, column=2, sticky="w", padx=(10, 0))
+        self.entry_case = ttk.Entry(card, textvariable=self.var_case)
+        self.entry_case.grid(row=0, column=1, sticky="ew", pady=4)
+        self.lbl_case_hint = ttk.Label(card, text="shown in every file name",
+                                       style="CardMuted.TLabel")
+        self.lbl_case_hint.grid(row=0, column=2, sticky="w", padx=(10, 0))
 
         ttk.Label(card, text="Documents folder", style="Card.TLabel").grid(
             row=1, column=0, sticky="w", pady=4, padx=(0, 10))
@@ -2700,8 +2797,17 @@ class App(ttkb.Window if ttkb else tk.Tk):
         ttk.Button(card, text="Browse folder", command=lambda: self._pick_dir(self.var_output)).grid(
             row=2, column=2, padx=(10, 0))
 
+        mode = ttk.Frame(card, style="Card.TFrame")
+        mode.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.chk_batch = ttk.Checkbutton(
+            mode, text="Many cases at once", style="Card.TCheckbutton",
+            variable=self.var_batch, command=self._on_batch_toggle)
+        self.chk_batch.pack(side="left")
+        self.lbl_batch_hint = ttk.Label(mode, style="CardMuted.TLabel")
+        self.lbl_batch_hint.pack(side="left", padx=(10, 0))
+
         found = ttk.Frame(card, style="Card.TFrame")
-        found.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        found.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         summary = ttk.Label(found, textvariable=self.var_found, style="CardMuted.TLabel",
                             wraplength=px(820), justify="left")
         summary.pack(fill="x", pady=(0, px(8)))
@@ -2716,6 +2822,29 @@ class App(ttkb.Window if ttkb else tk.Tk):
         ttk.Button(found, text="Try sample files", style="Link.TButton",
                    command=self._make_sample).pack(side="right", padx=(0, 10))
         self._recent_menu = tk.Menu(self, tearoff=0)
+        self._on_batch_toggle()
+
+    def _on_batch_toggle(self) -> None:
+        """Switch between 'one folder = one case' and 'each sub-folder = one case'."""
+        batch = bool(self.var_batch.get())
+        if batch:
+            self.lbl_batch_hint.config(
+                text="the folder you pick holds many cases - each sub-folder inside "
+                     "it becomes its own case, finished one after another")
+            self.entry_case.state(["disabled"])
+            self.lbl_case_hint.config(text="each sub-folder's name becomes the case name")
+            self.var_found.set("Press 'Check the folder' to see the cases inside.")
+            self._set_status("Batch mode: pick the folder that holds all your cases.")
+        else:
+            self.lbl_batch_hint.config(text="one folder = one case (the usual way)")
+            self.entry_case.state(["!disabled"])
+            self.lbl_case_hint.config(text="shown in every file name")
+            self._set_status("Ready. Choose the documents folder, then press RUN.")
+        self.cfg.set("batch.enabled", batch)
+        try:
+            self.cfg.save()
+        except Exception:
+            pass
 
     def _recent_list(self) -> list[str]:
         return list(self.cfg.get("ui.recent_folders") or [])
@@ -3519,6 +3648,10 @@ class App(ttkb.Window if ttkb else tk.Tk):
             return
         from . import pdf_ops
 
+        if self.var_batch.get():
+            self._check_case_folders(folder, pdf_ops)
+            return
+
         self._set_status("Checking the folder...")
         files = pdf_ops.collect_inputs(folder,
                                        self.cfg.get("merge.file_extensions") or [".pdf"])
@@ -3557,6 +3690,43 @@ class App(ttkb.Window if ttkb else tk.Tk):
         else:
             self._set_status("Looks good - press RUN.")
 
+    def _check_case_folders(self, folder: Path, pdf_ops) -> None:
+        """Batch version of _check_documents: report the cases inside a parent folder."""
+        self._set_status("Checking the cases inside...")
+        exts = self.cfg.get("merge.file_extensions") or [".pdf"]
+        cases, loose = pdf_ops.collect_case_folders(folder, exts)
+        if not cases:
+            self.var_found.set(f"Folder: {folder.name}  -  no case sub-folders found")
+            messagebox.showinfo(
+                "No case folders found",
+                f"No sub-folders with documents were found in:\n{folder}\n\n"
+                f"In 'Many cases at once' mode every case needs its own sub-folder, "
+                f"for example:\n\n    {folder.name}\\Case 1\\...documents\n"
+                f"    {folder.name}\\Case 2\\...documents\n\n"
+                f"Or untick 'Many cases at once' to run this folder as a single case.")
+            return
+        names = ", ".join(case.name for case in cases[:6])
+        if len(cases) > 6:
+            names += f", ...and {len(cases) - 6} more"
+        summary = f"Folder: {folder.name}  -  {len(cases)} case(s) to run one by one: {names}"
+        if loose:
+            summary += (f".  {len(loose)} loose file(s) sit directly in {folder.name} "
+                        f"and will be skipped - move them into a case folder if they belong to one.")
+        self.var_found.set(summary)
+        self.log_line(summary)
+        for case in cases:
+            count = len(pdf_ops.collect_inputs(case, exts))
+            self.log_line(f"  case: {case.name}  -  {count} document(s)")
+        if loose:
+            messagebox.showwarning(
+                "Loose files will be skipped",
+                f"{len(loose)} file(s) sit directly in:\n{folder}\n\n"
+                + "\n".join(f"  • {f.name}" for f in loose[:8])
+                + ("\n  ..." if len(loose) > 8 else "")
+                + "\n\nThey are NOT part of any case and will be skipped. "
+                  "Move them into a case sub-folder if they belong to one.")
+        self._set_status(f"Found {len(cases)} case(s) - press RUN to process them all.")
+
     # ------------------------------------------------------------------- run
     def _start(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -3573,16 +3743,39 @@ class App(ttkb.Window if ttkb else tk.Tk):
             return
         from . import pdf_ops
 
-        files = pdf_ops.collect_inputs(input_dir,
-                                       self.cfg.get("merge.file_extensions") or [".pdf"])
-        if not files:
-            messagebox.showerror("No documents found",
-                                 f"No PDF or image files were found in:\n{input_dir}\n\n"
-                                 f"Put the case documents there and press RUN again.")
-            return
-        if not case_name:
-            case_name = input_dir.name       # the folder name IS the case name
-            self.var_case.set(case_name)
+        batch = bool(self.var_batch.get())
+        case_folders: list[Path] = []
+        if batch:
+            exts = self.cfg.get("merge.file_extensions") or [".pdf"]
+            case_folders, loose = pdf_ops.collect_case_folders(input_dir, exts)
+            if not case_folders:
+                messagebox.showerror(
+                    "No case folders found",
+                    f"No sub-folders with documents were found in:\n{input_dir}\n\n"
+                    f"In 'Many cases at once' mode every case needs its own sub-folder.\n"
+                    f"Or untick 'Many cases at once' to run this folder as a single case.")
+                return
+            note = f"\n\nNote: {len(loose)} loose file(s) directly in the folder will be skipped." if loose else ""
+            if not messagebox.askokcancel(
+                    "Run all these cases?",
+                    f"{len(case_folders)} case(s) found in {input_dir.name}:\n\n"
+                    + "\n".join(f"  • {case.name}" for case in case_folders[:10])
+                    + (f"\n  ...and {len(case_folders) - 10} more" if len(case_folders) > 10 else "")
+                    + "\n\nThey will run one after another, each into its own output "
+                      "folder. A case that fails does not stop the rest." + note):
+                return
+            case_name = ""                    # each sub-folder's name is used
+        else:
+            files = pdf_ops.collect_inputs(input_dir,
+                                           self.cfg.get("merge.file_extensions") or [".pdf"])
+            if not files:
+                messagebox.showerror("No documents found",
+                                     f"No PDF or image files were found in:\n{input_dir}\n\n"
+                                     f"Put the case documents there and press RUN again.")
+                return
+            if not case_name:
+                case_name = input_dir.name       # the folder name IS the case name
+                self.var_case.set(case_name)
         self._remember_folder(input_dir)
 
         self._mark_all_steps("waiting", "not started")
@@ -3592,13 +3785,20 @@ class App(ttkb.Window if ttkb else tk.Tk):
         self.cancel_flag.clear()
         self.run_started_at = datetime.now()
         self._tick_run()
-        self._set_status(f"Working on {len(files)} document(s) - you can Cancel at any time.")
         self.log_line("")
         self.log_line("=" * 72)
-        self.log_line(f"RUN STARTED - {len(files)} document(s)")
+        if batch:
+            self._set_status(f"Working through {len(case_folders)} case(s) - "
+                             f"you can Cancel at any time.")
+            self.log_line(f"BATCH RUN STARTED - {len(case_folders)} case(s), one by one")
+            target, args = self._run_batch, (input_dir, case_folders,
+                                             Path(self.var_output.get().strip()))
+        else:
+            self._set_status(f"Working on {len(files)} document(s) - you can Cancel at any time.")
+            self.log_line(f"RUN STARTED - {len(files)} document(s)")
+            target, args = self._run_job, (input_dir, case_name)
         self.log_line("=" * 72)
-        self.worker = threading.Thread(target=self._run_job, args=(input_dir, case_name),
-                                       daemon=True)
+        self.worker = threading.Thread(target=target, args=args, daemon=True)
         self.worker.start()
 
     def _run_job(self, input_dir: Path, case_name: str) -> None:
@@ -3635,6 +3835,83 @@ class App(ttkb.Window if ttkb else tk.Tk):
             self.events.put(("done", report))
         except JobCancelled:
             self.events.put(("cancelled",))
+        except Exception as exc:                  # noqa: BLE001 - reported in the window
+            self.events.put(("error", f"{type(exc).__name__}: {exc}"))
+        finally:
+            if logger is not None and handler is not None:
+                try:
+                    logger.removeHandler(handler)
+                except Exception:
+                    pass
+
+    def _run_batch(self, parent_dir: Path, case_folders: list[Path],
+                   output_root: Path) -> None:
+        """Background thread: run the pipeline once per case folder, one by one.
+
+        A failing case is logged and skipped so it cannot stop the rest of the
+        batch.  Everything is gathered into one aggregate ``PipelineReport`` so
+        the usual finish screen can show the whole batch at a glance.
+        """
+        logger = None
+        handler = None
+        try:
+            from .pipeline import Pipeline, PipelineReport
+
+            reset_logger()
+            logger = get_logger(self.cfg.resolve("paths.logs"), verbose=True)
+            handler = GuiLogHandler(
+                lambda level, message: self.events.put(("log", level, message)))
+            handler.setLevel(logging.INFO)
+            logger.addHandler(handler)
+
+            def progress(message: str) -> None:
+                if self.cancel_flag.is_set():
+                    raise JobCancelled()
+                self.events.put(("progress", message))
+
+            total = len(case_folders)
+            batch = PipelineReport(case=f"{parent_dir.name} ({total} cases)")
+            batch.batch_root = output_root          # opened by _finish, not a case folder
+            logger.info("BATCH %s - %d case(s): %s", parent_dir, total,
+                        ", ".join(folder.name for folder in case_folders))
+            pipeline = Pipeline(self.cfg, progress=progress)
+            completed = 0
+            cancelled = False
+            for index, folder in enumerate(case_folders, 1):
+                if self.cancel_flag.is_set():
+                    cancelled = True
+                    break
+                logger.info("===== CASE %d of %d: %s =====", index, total, folder.name)
+                try:
+                    report = pipeline.run(case_name=folder.name, input_dir=folder)
+                except JobCancelled:
+                    cancelled = True
+                    break
+                except Exception as exc:            # noqa: BLE001 - one bad case must not
+                    batch.ok = False                # kill the remaining cases
+                    batch.warnings.append(
+                        f"{folder.name}: FAILED - {type(exc).__name__}: {exc}")
+                    logger.error("CASE %s FAILED: %s", folder.name, exc, exc_info=True)
+                    continue
+                completed += 1
+                batch.steps.extend(report.steps)
+                batch.outputs.extend(report.outputs)
+                batch.warnings.extend(f"{folder.name}: {w}" for w in report.warnings)
+                if not report.ok:
+                    batch.ok = False
+                logger.info("===== CASE %s finished: %d file(s) =====",
+                            folder.name, len(report.outputs))
+            batch.finished = datetime.now()
+            if cancelled:
+                if not completed and not batch.outputs:
+                    self.events.put(("cancelled",))
+                    return
+                batch.warnings.insert(
+                    0, f"Cancelled - {completed} of {total} case(s) finished, "
+                       f"the rest were not started.")
+                batch.ok = False
+            logger.info("BATCH FINISHED - %d of %d case(s) done", completed, total)
+            self.events.put(("done", batch))
         except Exception as exc:                  # noqa: BLE001 - reported in the window
             self.events.put(("error", f"{type(exc).__name__}: {exc}"))
         finally:
@@ -3864,7 +4141,7 @@ class App(ttkb.Window if ttkb else tk.Tk):
                 "Finished, with things worth knowing",
                 "\n".join(f"• {w}" for w in shown) + more)
         self._run_done_ui()
-        self.last_output = report.outputs[0].parent
+        self.last_output = getattr(report, "batch_root", None) or report.outputs[0].parent
 
         # ------- the result card: one glance at everything that matters.
         # Each fact becomes its own chip, worded so it is readable on its own -
@@ -3971,6 +4248,11 @@ class App(ttkb.Window if ttkb else tk.Tk):
             "   3. Click your court portal so the app knows its upload\n"
             "      limits.  Nothing else needs typing.\n"
             "   4. Press RUN and wait.\n\n"
+            "MANY CASES AT ONCE\n"
+            "   Tick 'Many cases at once' and pick the parent folder that\n"
+            "   holds, say, 'Case 1', 'Case 2', 'Case 3'...  Each sub-folder\n"
+            "   runs one after another into its own output folder.  A case\n"
+            "   that fails does not stop the rest.\n\n"
             "TAB 2 - ONE JOB AT A TIME\n"
             "   Need only one thing - OCR, or compress, or page numbers?\n"
             "   Open that page, add the files, press RUN.  The result is\n"

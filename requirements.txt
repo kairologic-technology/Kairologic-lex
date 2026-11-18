@@ -8,6 +8,7 @@
 # pip resolves the newest compatible release.
 pymupdf>=1.24.0      # PDF engine: merge, compress, page numbers, seal, split
 pillow>=10.0.0       # seal image preparation + placeholder seal drawing
+pdf2docx>=0.5.0      # PDF -> Word conversion that keeps layout (alignment, spacing, fonts)
 
 # ---------------------------------------------------------------------------
 # Optional extras. The app detects these at run time and degrades gracefully,

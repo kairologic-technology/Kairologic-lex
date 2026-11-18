@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -44,9 +47,12 @@ PRODUCER = f"KattyVision {__version__} (adaptive optimizer)"
 ProgressFn = Callable[[str], None]
 
 MIN_PAGE_COVER = 0.60      # an image covering less than this is an overlay/seal
+COMPRESS_WORKERS = 0       # 0 = auto: cores-1 but capped at 4 (each worker holds
+                           # a ~26 MB page render, so 7 workers can exhaust an
+                           # 8 GB machine and cause malloc failures)
 PROBE_DPI = 120            # cheap render used only to classify a page
 SATURATION_CUTOFF = 45     # HSV saturation above this counts as real colour
-COLOUR_SHARE_PCT = 0.05    # preserve small but important colored seals/signatures
+COLOUR_SHARE_PCT = 0.35    # preserve real seals/signatures (>0.35%), ignore scanner noise
 PAPER_LEVEL = 205          # gray value that counts as paper white
 WHITE_SHARE_PCT = 85.0     # % white that makes a page "text on paper"
 MIDTONE_SHARE_PCT = 12.0   # % mid-tones that means photos/shading/screenshots
@@ -349,21 +355,22 @@ def _render_dpi(klass: str, settings: QualityPreset) -> int:
     return settings.text_dpi if klass == "text_scan" else settings.photo_dpi
 
 
-def _optimize_once(src: Path, dst: Path, settings: QualityPreset, *,
-                   scrub_metadata: bool, progress: ProgressFn | None) -> tuple[OptimizeResult, int]:
-    """One full pass at ``settings``.  Returns (result, kept_page_count)."""
-    before = src.stat().st_size / MB
-    rows: list[PageRow] = []
-    kept = 0
-    with pymupdf.open(src) as doc:
-        total = doc.page_count
-        for index in range(total):
-            page = doc[index]
-            xref, cover = page_image(page)
-            row = PageRow(page=index + 1, klass="born_digital", cover=cover)
-            if xref is None or cover < MIN_PAGE_COVER:
-                rows.append(row)                       # vector / digital page
-                continue
+def _page_pass(doc: "pymupdf.Document", indices: list[int], total: int,
+               settings: QualityPreset) -> list[tuple]:
+    """Classify + render + encode the given pages of an open document.
+
+    Runs inside one worker thread, which owns ``doc`` exclusively, so PyMuPDF
+    is never touched from two threads at once.  Returns one tuple per page:
+    ``(index, row, xref, data)`` where ``data`` is None when the page is kept
+    as-is (born-digital, already smaller, or failed).
+    """
+    out: list[tuple] = []
+    for index in indices:
+        page = doc[index]
+        xref, cover = page_image(page)
+        row = PageRow(page=index + 1, klass="born_digital", cover=cover)
+        data = None
+        if xref is not None and cover >= MIN_PAGE_COVER:
             try:
                 row.before_kb = len(doc.extract_image(xref)["image"]) / 1024
             except Exception:
@@ -373,25 +380,71 @@ def _optimize_once(src: Path, dst: Path, settings: QualityPreset, *,
                     _render(page, min(PROBE_DPI, _render_dpi("mixed_scan", settings))))
                 row.klass = klass
                 image = _render(page, _render_dpi(klass, settings))
-                data, label, dpi = _encode(image, klass, settings)
-                row.after_kb, row.encoding, row.dpi = len(data) / 1024, label, dpi
+                encoded, label, dpi = _encode(image, klass, settings)
+                row.after_kb, row.encoding, row.dpi = len(encoded) / 1024, label, dpi
                 if row.before_kb and row.after_kb >= row.before_kb:
                     row.note = "kept - already smaller"
-                    kept += 1
                 else:
-                    page.replace_image(xref, stream=data)
+                    data = encoded
                     row.note = f"-{row.saving_pct:.0f}%"
-            except Exception as exc:                   # never break a filing
+            except Exception as exc:               # never break a filing
                 row.klass, row.note = "kept", f"kept as-is ({type(exc).__name__})"
-                kept += 1
                 LOGGER.warning("[optimize] page %d left untouched: %s", index + 1, exc)
-            rows.append(row)
-            LOGGER.debug("[optimize] page %d/%d %s cover=%.0f%% %.0f -> %.0f KB %s",
-                         index + 1, total, row.klass, cover * 100,
-                         row.before_kb, row.after_kb, row.note)
-            if progress and (index + 1) % 10 == 0:
-                progress(f"[optimize] {index + 1}/{total} pages")
+        out.append((index, row, xref, data))
+    return out
 
+
+def _optimize_once(src: Path, dst: Path, settings: QualityPreset,
+                   *, scrub_metadata: bool, progress: ProgressFn | None
+                   ) -> tuple[OptimizeResult, int]:
+    """One full pass at ``settings``.  Returns (result, kept_page_count).
+
+    The heavy per-page work (render + classify + encode) is spread over worker
+    threads - the same idea the OCR step uses - so a 500-page case compresses
+    several times faster on a multi-core machine.  Each worker opens its own
+    read-only handle on ``src``; the single shared document that gets written
+    stays on the calling thread.
+    """
+    before = src.stat().st_size / MB
+    with pymupdf.open(src) as doc:
+        total = doc.page_count
+    if total == 0:
+        rows: list[PageRow] = []
+    else:
+        cpu = os.cpu_count() or 4
+        workers = COMPRESS_WORKERS if COMPRESS_WORKERS > 0 else min(cpu - 1, 4)
+        workers = max(1, min(workers, total))
+        chunk = max(1, (total + workers - 1) // workers)
+        groups = [list(range(start, min(start + chunk, total)))
+                  for start in range(0, total, chunk)]
+
+        results: dict[int, tuple] = {}
+        lock = threading.Lock()
+        done_count = 0
+
+        def _run(group: list[int]) -> list[tuple]:
+            with pymupdf.open(src) as handle:      # read-only, owned by this thread
+                return _page_pass(handle, group, total, settings)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run, group): group for group in groups}
+            for future in as_completed(futures):
+                for index, row, xref, data in future.result():
+                    results[index] = (row, xref, data)
+                with lock:
+                    done_count += len(futures[future])
+                    if progress and (done_count // 10) != ((done_count - len(futures[future])) // 10):
+                        progress(f"[optimize] {min(done_count, total)}/{total} pages")
+        rows = [results[i][0] for i in range(total)]
+
+    kept = sum(1 for row in rows if row.note.startswith("kept"))
+    with pymupdf.open(src) as doc:
+        for index, (row, xref, data) in results.items():
+            if data is not None and xref is not None:
+                doc[index].replace_image(xref, stream=data)
+            LOGGER.debug("[optimize] page %d/%d %s cover=%.0f%% %.0f -> %.0f KB %s",
+                         index + 1, total, row.klass, row.cover * 100,
+                         row.before_kb, row.after_kb, row.note)
         if scrub_metadata:
             _scrub_metadata(doc)
         pdf_ops.save_compact(doc, dst, effort=1)
